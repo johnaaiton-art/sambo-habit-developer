@@ -41,10 +41,10 @@ class SamboBot:
         self.deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
         self.deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        self.sheet = None
         
         # Initialize Google Sheets
         self.gs_client = self._init_google_sheets()
-        self.sheet = None
         
     def _init_google_sheets(self):
         """Initialize Google Sheets client with service account credentials"""
