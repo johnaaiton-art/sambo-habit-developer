@@ -123,11 +123,14 @@ class SamboBot:
             worksheet = self.sheet.sheet1
             
             # Find existing row for this user and week
-            user_rows = worksheet.findall(str(user_id))
-            for cell in user_rows:
-                row_data = worksheet.row_values(cell.row)
-                if len(row_data) > 6 and row_data[6] == week_number:
-                    return cell.row, row_data
+            try:
+                user_rows = worksheet.findall(str(user_id))
+                for cell in user_rows:
+                    row_data = worksheet.row_values(cell.row)
+                    if len(row_data) > 6 and row_data[6] == week_number:
+                        return cell.row, row_data
+            except:
+                pass
             
             # Create new row
             new_row = [str(user_id), "", "", "", "", "", week_number, ""]
@@ -140,6 +143,10 @@ class SamboBot:
     def _record_habit(self, user_id, habit_id):
         """Record a completed habit"""
         try:
+            if not self.sheet:
+                logger.error("Sheet not initialized")
+                return False, "Sheet not initialized"
+            
             if habit_id not in HABITS:
                 return False, f"Invalid habit number. Use 1-5."
             
@@ -147,6 +154,7 @@ class SamboBot:
             row_num, row_data = self._get_user_row(user_id, week_number)
             
             if row_num is None:
+                logger.error(f"Failed to get row for user {user_id}")
                 return False, "Failed to record habit"
             
             # Column mapping: Date=1, Prayer=2, QiGong=3, Ball=4, Run=5, Strength=6
@@ -167,7 +175,9 @@ class SamboBot:
             
             return True, f"✓ {HABITS[habit_id]} recorded!"
         except Exception as e:
-            logger.error(f"Failed to record habit: {e}")
+            logger.error(f"Failed to record habit {habit_id} for user {user_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False, "Error recording habit"
 
     def _get_weekly_stats(self, user_id):
