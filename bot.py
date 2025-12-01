@@ -53,11 +53,16 @@ class SamboBot:
             if not creds_json:
                 logger.error("GOOGLE_CREDENTIALS_JSON not set")
                 return None
+            
+            if not self.sheet_id:
+                logger.error("GOOGLE_SHEET_ID not set")
+                return None
                 
             creds_dict = json.loads(creds_json)
             credentials = Credentials.from_service_account_info(
                 creds_dict,
-                scopes=['https://www.googleapis.com/auth/spreadsheets']
+                scopes=['https://www.googleapis.com/auth/spreadsheets', 
+                       'https://www.googleapis.com/auth/drive']
             )
             client = gspread.authorize(credentials)
             self.sheet = client.open_by_key(self.sheet_id)
@@ -444,24 +449,31 @@ Format the response in a friendly, engaging way for a Telegram message.
 
     def run(self):
         """Start the bot"""
+        if not self.bot_token:
+            logger.error("TELEGRAM_BOT_TOKEN not set")
+            return
+        
         app = Application.builder().token(self.bot_token).build()
         
         # Handlers
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
-        # Schedule weekly feedback
-        job_queue = app.job_queue
+        # Schedule weekly feedback if job queue is available
+        try:
+            job_queue = app.job_queue
+            if job_queue:
+                job_queue.run_daily(
+                    self.send_weekly_feedback,
+                    time=datetime.strptime("19:20", "%H:%M").time(),
+                    days=[5],
+                    tzinfo=MOSCOW_TZ
+                )
+                logger.info("Scheduled weekly feedback for Saturday 19:20 Moscow time")
+        except Exception as e:
+            logger.warning(f"Could not set up job queue: {e}")
         
-        # Saturday 19:20 Moscow time
-        job_queue.run_daily(
-            self.send_weekly_feedback,
-            time=datetime.strptime("19:20", "%H:%M").time(),
-            days=[5],  # Saturday
-            tzinfo=MOSCOW_TZ
-        )
-        
-        # Start bot
+        logger.info("Bot started and polling for messages...")
         app.run_polling()
 
 
