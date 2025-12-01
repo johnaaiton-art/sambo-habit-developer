@@ -1,10 +1,11 @@
 """
 Sambo Habits Tracking Telegram Bot
-Tracks daily and weekly habits with Google Sheets integration and DeepSeek feedback
+Tracks daily/weekly habits and consumption habits with Google Sheets integration
 """
 
 import os
 import json
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
@@ -13,7 +14,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import gspread
 from google.oauth2.service_account import Credentials
-import requests
 
 # Configure logging
 logging.basicConfig(
@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+# Sheet 1: Sambo Habits
 HABITS = {
     1: "Prayer with first water",
     2: "Qi Gong routine",
@@ -35,16 +37,26 @@ HABITS = {
 DAILY_HABITS = {1, 2, 3}
 WEEKLY_HABITS = {4, 5}
 
+# Sheet 2: Consumption Habits
+CONSUMPTION_HABITS = {
+    'x': "Coffee",
+    'y': "Sugary food",
+    'z': "Flour-based food"
+}
+
 class SamboBot:
     def __init__(self):
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
-        self.deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
-        self.sheet = None
         
         # Initialize Google Sheets
-        self.gs_client = self._init_google_sheets()
+        self.gs_client = None
+        self.sheet = None
+        self.consumption_sheet = None
+        self._init_google_sheets()
+        
+        # Track user state for consumption entry
+        self.user_states = {}  # user_id -> {'awaiting_type': 'x'/'y'/'z'}
         
     def _init_google_sheets(self):
         """Initialize Google Sheets client with service account credentials"""
@@ -52,11 +64,11 @@ class SamboBot:
             creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
             if not creds_json:
                 logger.error("GOOGLE_CREDENTIALS_JSON not set")
-                return None
+                return
             
             if not self.sheet_id:
                 logger.error("GOOGLE_SHEET_ID not set")
-                return None
+                return
                 
             creds_dict = json.loads(creds_json)
             credentials = Credentials.from_service_account_info(
@@ -64,13 +76,33 @@ class SamboBot:
                 scopes=['https://www.googleapis.com/auth/spreadsheets', 
                        'https://www.googleapis.com/auth/drive']
             )
-            client = gspread.authorize(credentials)
-            self.sheet = client.open_by_key(self.sheet_id)
+            self.gs_client = gspread.authorize(credentials)
+            
+            # Open the main spreadsheet
+            spreadsheet = self.gs_client.open_by_key(self.sheet_id)
+            
+            # Get or create the two sheets
+            try:
+                self.sheet = spreadsheet.worksheet("Sheet1")  # Sambo habits
+            except gspread.WorksheetNotFound:
+                self.sheet = spreadsheet.add_worksheet(title="Sambo Habits", rows=1000, cols=10)
+                logger.info("Created Sambo Habits sheet")
+            
+            try:
+                self.consumption_sheet = spreadsheet.worksheet("Consumption")
+            except gspread.WorksheetNotFound:
+                self.consumption_sheet = spreadsheet.add_worksheet(title="Consumption", rows=1000, cols=10)
+                logger.info("Created Consumption sheet")
+            
+            # Initialize sheet structures
+            self._ensure_sheet_structure()
+            self._ensure_consumption_sheet_structure()
+            
             logger.info("Google Sheets initialized successfully")
-            return client
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets: {e}")
-            return None
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _get_moscow_now(self):
         """Get current time in Moscow timezone"""
@@ -93,35 +125,32 @@ class SamboBot:
         week_start = self._get_week_start(date)
         return week_start.strftime("%Y-%m-%d")
 
+    # ========== SHEET 1: SAMBO HABITS ==========
+    
     def _ensure_sheet_structure(self):
-        """Ensure Google Sheet has proper structure"""
+        """Ensure Sheet1 has proper structure"""
         try:
             if not self.sheet:
-                logger.warning("Sheet not initialized, skipping structure check")
                 return
             
-            worksheet = self.sheet.sheet1
-            
             # Check if headers exist
-            headers = worksheet.row_values(1)
+            headers = self.sheet.row_values(1)
             expected_headers = [
                 "User ID", "Date", "Prayer", "Qi Gong", "Ball", "Run/Stretch", 
                 "Strength/Stretch", "Week Number", "Goals from Last Week"
             ]
             
             if headers != expected_headers:
-                # Clear and set headers
-                worksheet.clear()
-                worksheet.append_row(expected_headers)
-                logger.info("Sheet structure initialized")
+                self.sheet.clear()
+                self.sheet.append_row(expected_headers)
+                logger.info("Sheet1 structure initialized")
         except Exception as e:
             logger.error(f"Failed to ensure sheet structure: {e}")
 
     def _get_user_row(self, user_id, week_number):
-        """Get or create user's row for the week"""
+        """Get or create user's row for the week in Sheet1"""
         try:
-            worksheet = self.sheet.sheet1
-            all_rows = worksheet.get_all_values()
+            all_rows = self.sheet.get_all_values()
             
             # Find existing row for this user and week
             for row_idx, row in enumerate(all_rows[1:], start=2):  # Skip header
@@ -132,16 +161,14 @@ class SamboBot:
             
             # Create new row
             new_row = [str(user_id), "", "", "", "", "", "", week_number, ""]
-            worksheet.append_row(new_row)
-            return worksheet.row_count, new_row
+            self.sheet.append_row(new_row)
+            return self.sheet.row_count, new_row
         except Exception as e:
             logger.error(f"Failed to get user row: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
             return None, None
 
     def _record_habit(self, user_id, habit_id):
-        """Record a completed habit"""
+        """Record a completed habit in Sheet1"""
         try:
             if not self.sheet:
                 logger.error("Sheet not initialized")
@@ -162,230 +189,262 @@ class SamboBot:
             col = col_map[habit_id]
             
             # Check for duplicates
-            worksheet = self.sheet.sheet1
-            current_value = worksheet.cell(row_num, col).value
+            current_value = self.sheet.cell(row_num, col).value
             
             if current_value:
                 return False, f"{HABITS[habit_id]} already recorded today"
             
             # Record the habit with today's date
             today = self._get_moscow_now().strftime("%Y-%m-%d")
-            worksheet.update_cell(row_num, 2, today)  # Update date column
-            worksheet.update_cell(row_num, col, "✓")  # Mark as done
+            self.sheet.update_cell(row_num, 2, today)  # Update date column
+            self.sheet.update_cell(row_num, col, "✓")  # Mark as done
             
             logger.info(f"Recorded habit {habit_id} for user {user_id} in row {row_num}, col {col}")
             return True, f"✓ {HABITS[habit_id]} recorded!"
         except Exception as e:
             logger.error(f"Failed to record habit {habit_id} for user {user_id}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
             return False, "Error recording habit"
 
-    def _get_weekly_stats(self, user_id):
-        """Get statistics for the current week"""
+    # ========== SHEET 2: CONSUMPTION HABITS ==========
+    
+    def _ensure_consumption_sheet_structure(self):
+        """Ensure Consumption sheet has proper structure"""
         try:
-            week_number = self._get_week_number()
-            worksheet = self.sheet.sheet1
+            if not self.consumption_sheet:
+                return
             
-            # Find all rows for this user in current week
-            stats = {
-                1: 0,  # Prayer
-                2: 0,  # Qi Gong
-                3: 0,  # Ball
-                4: 0,  # Run
-                5: 0   # Strength
-            }
+            # Check if headers exist
+            headers = self.consumption_sheet.row_values(1)
+            expected_headers = [
+                "User ID", "Date", "Week Number", "Coffee (x)", "Coffee Cost (руб)", 
+                "Sugary (y)", "Sugary Cost (руб)", "Flour (z)", "Flour Cost (руб)"
+            ]
             
-            all_rows = worksheet.get_all_values()
+            if headers != expected_headers:
+                self.consumption_sheet.clear()
+                self.consumption_sheet.append_row(expected_headers)
+                logger.info("Consumption sheet structure initialized")
+        except Exception as e:
+            logger.error(f"Failed to ensure consumption sheet structure: {e}")
+
+    def _get_consumption_row(self, user_id, week_number, date=None):
+        """Get or create user's row for consumption tracking"""
+        try:
+            if not self.consumption_sheet:
+                return None, None
+            
+            if date is None:
+                date = self._get_moscow_now()
+            
+            today_str = date.strftime("%Y-%m-%d")
+            all_rows = self.consumption_sheet.get_all_values()
+            
+            # Find existing row for this user, week, and specific date
             for row_idx, row in enumerate(all_rows[1:], start=2):  # Skip header
-                if len(row) > 7 and row[0] == str(user_id) and row[7] == week_number:
-                    # Check each habit column (now columns 3-7)
-                    for habit_id in range(1, 6):
-                        col = habit_id + 2  # Offset by 2 (UserID + Date)
-                        if col < len(row) and row[col] == "✓":
-                            stats[habit_id] += 1
+                if len(row) > 2:
+                    # Check User ID (col 0), Date (col 1), and Week Number (col 2)
+                    if row[0] == str(user_id) and row[1] == today_str and row[2] == week_number:
+                        return row_idx, row
             
-            return stats
+            # Create new row for today
+            new_row = [str(user_id), today_str, week_number, "", "", "", "", "", ""]
+            self.consumption_sheet.append_row(new_row)
+            return self.consumption_sheet.row_count, new_row
         except Exception as e:
-            logger.error(f"Failed to get weekly stats: {e}")
-            return None
+            logger.error(f"Failed to get consumption row: {e}")
+            return None, None
 
-    def _get_previous_weeks_stats(self, user_id, weeks_back=3):
-        """Get statistics from previous weeks"""
+    def _parse_consumption_input(self, text):
+        """Parse consumption input like 'xxx', 'xx 150', 'y 75', etc."""
+        text = text.strip().lower()
+        
+        # Match pattern: (x,y,z letters) optional space optional number
+        match = re.match(r'^([xyz]+)(?:\s+(\d+))?$', text)
+        if not match:
+            return None, None
+        
+        letters = match.group(1)
+        cost = match.group(2)
+        
+        # Determine type (x, y, or z)
+        if 'x' in letters:
+            habit_type = 'x'
+        elif 'y' in letters:
+            habit_type = 'y'
+        elif 'z' in letters:
+            habit_type = 'z'
+        else:
+            return None, None
+        
+        # Count the specific letters (filter only the relevant type)
+        count = letters.count(habit_type)
+        
+        # Convert cost to integer if provided
+        cost_int = int(cost) if cost else 0
+        
+        return habit_type, count, cost_int
+
+    def _record_consumption(self, user_id, text):
+        """Record consumption in Sheet2"""
         try:
-            worksheet = self.sheet.sheet1
-            all_rows = worksheet.get_all_values()
+            if not self.consumption_sheet:
+                return False, "Consumption sheet not initialized"
             
-            previous_stats = {}
-            current_date = self._get_moscow_now()
+            # Parse input
+            result = self._parse_consumption_input(text)
+            if not result:
+                return False, "Invalid format. Use like 'x', 'xxx', 'xx 150', 'y 75', 'zzz 200'"
             
-            for week_offset in range(1, weeks_back + 1):
-                week_date = current_date - timedelta(weeks=week_offset)
-                week_number = self._get_week_number(week_date)
-                
-                stats = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-                
-                for row in all_rows[1:]:
-                    if len(row) > 7 and row[0] == str(user_id) and row[7] == week_number:
-                        for habit_id in range(1, 6):
-                            col = habit_id + 2
-                            if col < len(row) and row[col] == "✓":
-                                stats[habit_id] += 1
-                
-                previous_stats[week_number] = stats
+            habit_type, count, cost = result
             
-            return previous_stats
+            # Get current date and week
+            now = self._get_moscow_now()
+            today_str = now.strftime("%Y-%m-%d")
+            week_number = self._get_week_number(now)
+            
+            # Get or create row for today
+            row_num, row_data = self._get_consumption_row(user_id, week_number, now)
+            if row_num is None:
+                return False, "Failed to create consumption record"
+            
+            # Determine columns based on type
+            if habit_type == 'x':
+                count_col = 4  # Coffee (x)
+                cost_col = 5   # Coffee Cost
+            elif habit_type == 'y':
+                count_col = 6  # Sugary (y)
+                cost_col = 7   # Sugary Cost
+            else:  # 'z'
+                count_col = 8  # Flour (z)
+                cost_col = 9   # Flour Cost
+            
+            # Get current values
+            current_count_str = self.consumption_sheet.cell(row_num, count_col).value or "0"
+            current_cost_str = self.consumption_sheet.cell(row_num, cost_col).value or "0"
+            
+            # Parse current values
+            current_count = int(current_count_str) if current_count_str.isdigit() else 0
+            current_cost = int(current_cost_str) if current_cost_str.isdigit() else 0
+            
+            # Update values
+            new_count = current_count + count
+            new_cost = current_cost + cost
+            
+            # Update cells
+            self.consumption_sheet.update_cell(row_num, count_col, str(new_count))
+            if cost > 0:
+                self.consumption_sheet.update_cell(row_num, cost_col, str(new_cost))
+            
+            # Prepare response
+            habit_name = CONSUMPTION_HABITS[habit_type]
+            response = f"✓ {habit_name}: +{count} dose(s)"
+            if cost > 0:
+                response += f", +{cost} руб"
+            response += f"\nToday's total: {new_count} dose(s)"
+            if new_cost > 0:
+                response += f", {new_cost} руб"
+            
+            logger.info(f"Recorded consumption: user={user_id}, type={habit_type}, count={count}, cost={cost}")
+            return True, response
+            
         except Exception as e:
-            logger.error(f"Failed to get previous weeks stats: {e}")
-            return {}
+            logger.error(f"Failed to record consumption: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False, "Error recording consumption"
 
-    def _get_last_week_goals(self, user_id):
-        """Get goals set for this week"""
+    def _get_weekly_consumption_summary(self, user_id):
+        """Get weekly consumption summary for feedback"""
         try:
+            if not self.consumption_sheet:
+                return None
+            
             week_number = self._get_week_number()
-            worksheet = self.sheet.sheet1
-            all_rows = worksheet.get_all_values()
+            all_rows = self.consumption_sheet.get_all_values()
+            
+            totals = {
+                'x_count': 0,
+                'x_cost': 0,
+                'y_count': 0,
+                'y_cost': 0,
+                'z_count': 0,
+                'z_cost': 0
+            }
             
             for row in all_rows[1:]:
-                if len(row) > 8 and row[0] == str(user_id) and row[7] == week_number:
-                    return row[8] if row[8] else None
+                if len(row) > 8 and row[0] == str(user_id) and row[2] == week_number:
+                    # Coffee
+                    if row[3] and row[3].isdigit():
+                        totals['x_count'] += int(row[3])
+                    if row[4] and row[4].isdigit():
+                        totals['x_cost'] += int(row[4])
+                    
+                    # Sugary
+                    if row[5] and row[5].isdigit():
+                        totals['y_count'] += int(row[5])
+                    if row[6] and row[6].isdigit():
+                        totals['y_cost'] += int(row[6])
+                    
+                    # Flour
+                    if row[7] and row[7].isdigit():
+                        totals['z_count'] += int(row[7])
+                    if row[8] and row[8].isdigit():
+                        totals['z_cost'] += int(row[8])
             
-            return None
+            return totals
         except Exception as e:
-            logger.error(f"Failed to get last week goals: {e}")
+            logger.error(f"Failed to get weekly consumption summary: {e}")
             return None
 
-    def _generate_feedback(self, user_id, stats, previous_stats):
-        """Generate feedback using DeepSeek API"""
-        try:
-            # Prepare data for DeepSeek
-            current_week = self._get_week_number()
-            
-            # Calculate statistics
-            daily_completion = {h: stats[h] for h in DAILY_HABITS}
-            weekly_completion = {h: stats[h] for h in WEEKLY_HABITS}
-            
-            # Get previous week's stats for comparison
-            prev_week_date = self._get_moscow_now() - timedelta(weeks=1)
-            prev_week_number = self._get_week_number(prev_week_date)
-            prev_stats = previous_stats.get(prev_week_number, {})
-            
-            # Get goals from last week
-            last_goals = self._get_last_week_goals(user_id)
-            
-            prompt = f"""
-Analyze the Sambo training habits for the week of {current_week}:
-
-Current Week Statistics:
-- Prayer with first water: {daily_completion[1]}/6 days
-- Qi Gong routine: {daily_completion[2]}/6 days
-- Freestyling on the ball: {daily_completion[3]}/6 days
-- 20 minute run and stretch: {weekly_completion[4]}/1 session
-- Strengthening and stretching: {weekly_completion[5]}/1 session
-
-Previous Week Statistics:
-- Prayer: {prev_stats.get(1, 0)}/6 days
-- Qi Gong: {prev_stats.get(2, 0)}/6 days
-- Ball: {prev_stats.get(3, 0)}/6 days
-- Run: {prev_stats.get(4, 0)}/1 session
-- Strength: {prev_stats.get(5, 0)}/1 session
-
-Goals from Last Week: {last_goals or "None set"}
-
-Please provide:
-1. A clear summary of this week's performance
-2. Comparison to last week - what improved or declined
-3. If any habit declined or didn't reach maximum, ask for an improvement plan
-4. Reference any goals mentioned from last week and whether they were achieved
-5. Keep tone encouraging but honest
-
-Format the response in a friendly, engaging way for a Telegram message.
-"""
-            
-            headers = {
-                "Authorization": f"Bearer {self.deepseek_api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            data = {
-                "model": "deepseek-chat",
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.7,
-                "max_tokens": 1000
-            }
-            
-            response = requests.post(
-                f"{self.deepseek_base_url}/v1/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                feedback = result['choices'][0]['message']['content']
-                return feedback
-            else:
-                logger.error(f"DeepSeek API error: {response.status_code}")
-                return self._generate_default_feedback(stats, prev_stats)
-        except Exception as e:
-            logger.error(f"Failed to generate feedback: {e}")
-            return self._generate_default_feedback(stats, prev_stats)
-
-    def _generate_default_feedback(self, stats, prev_stats):
-        """Generate default feedback if API fails"""
-        feedback = "📊 **Weekly Summary**\n\n"
+    def _format_consumption_feedback(self, totals):
+        """Format consumption feedback for weekly report"""
+        if not totals:
+            return "No consumption data this week."
         
-        for habit_id in range(1, 6):
-            current = stats.get(habit_id, 0)
-            previous = prev_stats.get(habit_id, 0)
-            habit_name = HABITS[habit_id]
-            
-            if habit_id in DAILY_HABITS:
-                feedback += f"• {habit_name}: {current}/6 days"
-            else:
-                feedback += f"• {habit_name}: {current}/1 session"
-            
-            if previous > 0:
-                if current > previous:
-                    feedback += " ⬆️ (improved)"
-                elif current < previous:
-                    feedback += " ⬇️ (declined)"
-                else:
-                    feedback += " ➡️ (same)"
-            
-            feedback += "\n"
+        feedback = "☕ **Consumption Summary**\n\n"
+        
+        # Coffee
+        feedback += f"• Coffee (x): {totals['x_count']} dose(s)"
+        if totals['x_cost'] > 0:
+            feedback += f", {totals['x_cost']} руб"
+        feedback += "\n"
+        
+        # Sugary
+        feedback += f"• Sugary food (y): {totals['y_count']} dose(s)"
+        if totals['y_cost'] > 0:
+            feedback += f", {totals['y_cost']} руб"
+        feedback += "\n"
+        
+        # Flour
+        feedback += f"• Flour-based food (z): {totals['z_count']} dose(s)"
+        if totals['z_cost'] > 0:
+            feedback += f", {totals['z_cost']} руб"
+        feedback += "\n"
+        
+        # Calculate totals
+        total_cost = totals['x_cost'] + totals['y_cost'] + totals['z_cost']
+        feedback += f"\n💰 **Weekly total spent**: {total_cost} руб"
         
         return feedback
 
-    def _should_ask_for_goals(self, stats, prev_stats):
-        """Determine if we should ask for improvement goals"""
-        for habit_id in range(1, 6):
-            current = stats.get(habit_id, 0)
-            previous = prev_stats.get(habit_id, 0)
-            
-            # Max values
-            max_val = 6 if habit_id in DAILY_HABITS else 1
-            
-            # Ask if declined or didn't improve and not at max
-            if current < previous or (current == previous and current < max_val):
-                return True
-        
-        return False
-
+    # ========== TELEGRAM HANDLERS ==========
+    
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command"""
         await update.message.reply_text(
-            "🥋 Welcome to Sambo Habits Tracker!\n\n"
-            "Send me a number (1-5) to log your habits:\n"
+            "🥋 Welcome to Sambo Habits & Consumption Tracker!\n\n"
+            "**For Sambo Habits (1-5):**\n"
             "1 - Prayer with first water\n"
             "2 - Qi Gong routine\n"
             "3 - Freestyling on the ball\n"
             "4 - 20 minute run and stretch\n"
             "5 - Strengthening and stretching\n\n"
-            "Send each number separately. Sunday is a rest day."
+            "**For Consumption Tracking:**\n"
+            "• x - Coffee dose (x, xx, xxx 150)\n"
+            "• y - Sugary food (y, yy 75)\n"
+            "• z - Flour-based food (z, zz 200)\n\n"
+            "Add price after space if purchased.\n"
+            "Send each entry separately. Sunday is rest day."
         )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -393,77 +452,88 @@ Format the response in a friendly, engaging way for a Telegram message.
         user_id = update.effective_user.id
         text = update.message.text.strip()
         
-        # Check if it's a number
-        if not text.isdigit():
-            await update.message.reply_text("Please send a number (1-5)")
+        # Check for consumption entries first (x, y, z)
+        if text and text[0].lower() in ['x', 'y', 'z']:
+            success, message = self._record_consumption(user_id, text)
+            await update.message.reply_text(message)
             return
         
-        habit_id = int(text)
-        success, message = self._record_habit(user_id, habit_id)
+        # Check for sambo habit numbers (1-5)
+        if text.isdigit() and 1 <= int(text) <= 5:
+            habit_id = int(text)
+            success, message = self._record_habit(user_id, habit_id)
+            await update.message.reply_text(message)
+            return
         
-        await update.message.reply_text(message)
+        # Check for other consumption patterns
+        if any(char.lower() in ['x', 'y', 'z'] for char in text):
+            success, message = self._record_consumption(user_id, text)
+            await update.message.reply_text(message)
+            return
+        
+        # Unknown input
+        await update.message.reply_text(
+            "Please send:\n"
+            "• A number 1-5 for Sambo habits\n"
+            "• x, y, or z for consumption (e.g., 'x', 'xx 150', 'yyy 200')"
+        )
 
     async def send_weekly_feedback(self, context: ContextTypes.DEFAULT_TYPE):
-        """Send weekly feedback on Saturday at 19:20 Moscow time"""
-        # This will be called by the scheduler
+        """Send weekly feedback on Saturday at 18:20 Moscow time"""
         logger.info("Sending weekly feedback")
         
         try:
-            # Get all users from sheet
-            worksheet = self.sheet.sheet1
-            all_rows = worksheet.get_all_values()
+            # Get all users from both sheets
+            sambo_users = set()
+            consumption_users = set()
             
-            users = set()
-            for row in all_rows[1:]:
-                if row and row[0]:  # Check User ID column
-                    try:
-                        users.add(int(row[0]))
-                    except ValueError:
-                        continue
+            # Get users from Sambo sheet
+            if self.sheet:
+                all_rows = self.sheet.get_all_values()
+                for row in all_rows[1:]:
+                    if row and row[0]:
+                        try:
+                            sambo_users.add(int(row[0]))
+                        except ValueError:
+                            continue
             
-            for user_id in users:
-                stats = self._get_weekly_stats(user_id)
-                previous_stats = self._get_previous_weeks_stats(user_id, weeks_back=3)
-                
-                feedback = self._generate_feedback(user_id, stats, previous_stats)
-                
-                # Send feedback
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=feedback,
-                    parse_mode="Markdown"
-                )
-                
-                # Ask for goals if needed
-                if self._should_ask_for_goals(stats, previous_stats):
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text="📝 What's your plan to improve next week? Reply with your goals."
-                    )
+            # Get users from Consumption sheet
+            if self.consumption_sheet:
+                all_rows = self.consumption_sheet.get_all_values()
+                for row in all_rows[1:]:
+                    if row and row[0]:
+                        try:
+                            consumption_users.add(int(row[0]))
+                        except ValueError:
+                            continue
+            
+            # Combine all users
+            all_users = sambo_users.union(consumption_users)
+            
+            for user_id in all_users:
+                try:
+                    # Send consumption summary
+                    totals = self._get_weekly_consumption_summary(user_id)
+                    if totals and (totals['x_count'] > 0 or totals['y_count'] > 0 or totals['z_count'] > 0):
+                        consumption_feedback = self._format_consumption_feedback(totals)
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=consumption_feedback,
+                            parse_mode="Markdown"
+                        )
+                        await asyncio.sleep(1)  # Small delay between messages
+                        
+                    # Note: You could add Sambo feedback here too if needed
+                    # (you already have the logic from your original code)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send feedback to user {user_id}: {e}")
+                    continue
+                    
         except Exception as e:
             logger.error(f"Failed to send weekly feedback: {e}")
-
-    async def handle_goal_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle goal input from user"""
-        user_id = update.effective_user.id
-        goal_text = update.message.text
-        
-        try:
-            week_number = self._get_week_number()
-            worksheet = self.sheet.sheet1
-            
-            # Find user's row for this week
-            all_rows = worksheet.get_all_values()
-            for row_idx, row in enumerate(all_rows[1:], start=2):
-                if len(row) > 7 and row[0] == str(user_id) and row[7] == week_number:
-                    # Update goals column (index 9, column I)
-                    worksheet.update_cell(row_idx, 9, goal_text)
-                    await update.message.reply_text("✓ Goals recorded for next week!")
-                    return
-        except Exception as e:
-            logger.error(f"Failed to record goals: {e}")
-        
-        await update.message.reply_text("Error recording goals")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def run(self):
         """Start the bot"""
@@ -481,13 +551,14 @@ Format the response in a friendly, engaging way for a Telegram message.
         try:
             job_queue = app.job_queue
             if job_queue:
+                # Consumption feedback at 18:20 on Saturday
                 job_queue.run_daily(
                     self.send_weekly_feedback,
-                    time=datetime.strptime("19:20", "%H:%M").time(),
-                    days=[5],
+                    time=datetime.strptime("18:20", "%H:%M").time(),
+                    days=[5],  # Saturday
                     tzinfo=MOSCOW_TZ
                 )
-                logger.info("Scheduled weekly feedback for Saturday 19:20 Moscow time")
+                logger.info("Scheduled consumption feedback for Saturday 18:20 Moscow time")
         except Exception as e:
             logger.warning(f"Could not set up job queue: {e}")
         
@@ -497,5 +568,4 @@ Format the response in a friendly, engaging way for a Telegram message.
 
 if __name__ == "__main__":
     bot = SamboBot()
-    bot._ensure_sheet_structure()
     bot.run()
