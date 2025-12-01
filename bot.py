@@ -96,6 +96,10 @@ class SamboBot:
     def _ensure_sheet_structure(self):
         """Ensure Google Sheet has proper structure"""
         try:
+            if not self.sheet:
+                logger.warning("Sheet not initialized, skipping structure check")
+                return
+            
             worksheet = self.sheet.sheet1
             
             # Check if headers exist
