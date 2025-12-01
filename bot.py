@@ -105,7 +105,7 @@ class SamboBot:
             # Check if headers exist
             headers = worksheet.row_values(1)
             expected_headers = [
-                "Date", "Prayer", "Qi Gong", "Ball", "Run/Stretch", 
+                "User ID", "Date", "Prayer", "Qi Gong", "Ball", "Run/Stretch", 
                 "Strength/Stretch", "Week Number", "Goals from Last Week"
             ]
             
@@ -121,23 +121,23 @@ class SamboBot:
         """Get or create user's row for the week"""
         try:
             worksheet = self.sheet.sheet1
+            all_rows = worksheet.get_all_values()
             
             # Find existing row for this user and week
-            try:
-                user_rows = worksheet.findall(str(user_id))
-                for cell in user_rows:
-                    row_data = worksheet.row_values(cell.row)
-                    if len(row_data) > 6 and row_data[6] == week_number:
-                        return cell.row, row_data
-            except:
-                pass
+            for row_idx, row in enumerate(all_rows[1:], start=2):  # Skip header
+                if len(row) > 7:
+                    # Check User ID (col 0) and Week Number (col 7)
+                    if row[0] == str(user_id) and row[7] == week_number:
+                        return row_idx, row
             
             # Create new row
-            new_row = [str(user_id), "", "", "", "", "", week_number, ""]
+            new_row = [str(user_id), "", "", "", "", "", "", week_number, ""]
             worksheet.append_row(new_row)
             return worksheet.row_count, new_row
         except Exception as e:
             logger.error(f"Failed to get user row: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None, None
 
     def _record_habit(self, user_id, habit_id):
@@ -157,8 +157,8 @@ class SamboBot:
                 logger.error(f"Failed to get row for user {user_id}")
                 return False, "Failed to record habit"
             
-            # Column mapping: Date=1, Prayer=2, QiGong=3, Ball=4, Run=5, Strength=6
-            col_map = {1: 2, 2: 3, 3: 4, 4: 5, 5: 6}
+            # Column mapping: UserID=1, Date=2, Prayer=3, QiGong=4, Ball=5, Run=6, Strength=7
+            col_map = {1: 3, 2: 4, 3: 5, 4: 6, 5: 7}
             col = col_map[habit_id]
             
             # Check for duplicates
@@ -170,9 +170,10 @@ class SamboBot:
             
             # Record the habit with today's date
             today = self._get_moscow_now().strftime("%Y-%m-%d")
-            worksheet.update_cell(row_num, 1, today)  # Update date
+            worksheet.update_cell(row_num, 2, today)  # Update date column
             worksheet.update_cell(row_num, col, "✓")  # Mark as done
             
+            logger.info(f"Recorded habit {habit_id} for user {user_id} in row {row_num}, col {col}")
             return True, f"✓ {HABITS[habit_id]} recorded!"
         except Exception as e:
             logger.error(f"Failed to record habit {habit_id} for user {user_id}: {e}")
@@ -197,10 +198,10 @@ class SamboBot:
             
             all_rows = worksheet.get_all_values()
             for row_idx, row in enumerate(all_rows[1:], start=2):  # Skip header
-                if len(row) > 6 and row[6] == week_number:
-                    # Check each habit column
+                if len(row) > 7 and row[0] == str(user_id) and row[7] == week_number:
+                    # Check each habit column (now columns 3-7)
                     for habit_id in range(1, 6):
-                        col = habit_id + 1
+                        col = habit_id + 2  # Offset by 2 (UserID + Date)
                         if col < len(row) and row[col] == "✓":
                             stats[habit_id] += 1
             
@@ -225,9 +226,9 @@ class SamboBot:
                 stats = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
                 
                 for row in all_rows[1:]:
-                    if len(row) > 6 and row[6] == week_number:
+                    if len(row) > 7 and row[0] == str(user_id) and row[7] == week_number:
                         for habit_id in range(1, 6):
-                            col = habit_id + 1
+                            col = habit_id + 2
                             if col < len(row) and row[col] == "✓":
                                 stats[habit_id] += 1
                 
@@ -246,8 +247,8 @@ class SamboBot:
             all_rows = worksheet.get_all_values()
             
             for row in all_rows[1:]:
-                if len(row) > 7 and row[6] == week_number:
-                    return row[7] if row[7] else None
+                if len(row) > 8 and row[0] == str(user_id) and row[7] == week_number:
+                    return row[8] if row[8] else None
             
             return None
         except Exception as e:
@@ -414,8 +415,11 @@ Format the response in a friendly, engaging way for a Telegram message.
             
             users = set()
             for row in all_rows[1:]:
-                if row:
-                    users.add(int(row[0]))
+                if row and row[0]:  # Check User ID column
+                    try:
+                        users.add(int(row[0]))
+                    except ValueError:
+                        continue
             
             for user_id in users:
                 stats = self._get_weekly_stats(user_id)
@@ -451,9 +455,9 @@ Format the response in a friendly, engaging way for a Telegram message.
             # Find user's row for this week
             all_rows = worksheet.get_all_values()
             for row_idx, row in enumerate(all_rows[1:], start=2):
-                if len(row) > 6 and row[6] == week_number:
-                    # Update goals column (index 7)
-                    worksheet.update_cell(row_idx, 8, goal_text)
+                if len(row) > 7 and row[0] == str(user_id) and row[7] == week_number:
+                    # Update goals column (index 9, column I)
+                    worksheet.update_cell(row_idx, 9, goal_text)
                     await update.message.reply_text("✓ Goals recorded for next week!")
                     return
         except Exception as e:
