@@ -1,6 +1,6 @@
 """
 Sambo Habits Tracking Telegram Bot
-Tracks daily/weekly habits and consumption habits with Google Sheets integration
+Tracks activity, consumption, and language learning habits with Google Sheets integration
 """
 
 import os
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Constants
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
-# Sheet 1: Sambo Habits
+# Sheet 1: Sambo Activity Habits
 HABITS = {
     1: "Prayer with first water",
     2: "Qi Gong routine",
@@ -44,6 +44,13 @@ CONSUMPTION_HABITS = {
     'z': "Flour-based food"
 }
 
+# Sheet 3: Language Learning Habits
+LANGUAGE_HABITS = {
+    'ch': "Chinese activation",
+    'he': "Hebrew cards",
+    'ta': "Tatar cards"
+}
+
 class SamboBot:
     def __init__(self):
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -51,12 +58,10 @@ class SamboBot:
         
         # Initialize Google Sheets
         self.gs_client = None
-        self.sheet = None
+        self.activity_sheet = None
         self.consumption_sheet = None
+        self.language_sheet = None
         self._init_google_sheets()
-        
-        # Track user state for consumption entry
-        self.user_states = {}  # user_id -> {'awaiting_type': 'x'/'y'/'z'}
         
     def _init_google_sheets(self):
         """Initialize Google Sheets client with service account credentials"""
@@ -81,28 +86,68 @@ class SamboBot:
             # Open the main spreadsheet
             spreadsheet = self.gs_client.open_by_key(self.sheet_id)
             
-            # Get or create the two sheets
+            # Get or create the three sheets
             try:
-                self.sheet = spreadsheet.worksheet("Sheet1")  # Sambo habits
+                self.activity_sheet = spreadsheet.worksheet("Activity")
             except gspread.WorksheetNotFound:
-                self.sheet = spreadsheet.add_worksheet(title="Sambo Habits", rows=1000, cols=10)
-                logger.info("Created Sambo Habits sheet")
+                self.activity_sheet = spreadsheet.add_worksheet(title="Activity", rows=100, cols=10)
+                logger.info("Created Activity sheet")
             
             try:
                 self.consumption_sheet = spreadsheet.worksheet("Consumption")
             except gspread.WorksheetNotFound:
-                self.consumption_sheet = spreadsheet.add_worksheet(title="Consumption", rows=1000, cols=10)
+                self.consumption_sheet = spreadsheet.add_worksheet(title="Consumption", rows=100, cols=10)
                 logger.info("Created Consumption sheet")
             
+            try:
+                self.language_sheet = spreadsheet.worksheet("Language")
+            except gspread.WorksheetNotFound:
+                self.language_sheet = spreadsheet.add_worksheet(title="Language", rows=100, cols=10)
+                logger.info("Created Language sheet")
+            
             # Initialize sheet structures
-            self._ensure_sheet_structure()
+            self._ensure_activity_sheet_structure()
             self._ensure_consumption_sheet_structure()
+            self._ensure_language_sheet_structure()
             
             logger.info("Google Sheets initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    def _trim_sheet(self, worksheet):
+        """Remove empty rows and columns beyond actual data to prevent phantom cells"""
+        try:
+            all_values = worksheet.get_all_values()
+            
+            # Find last row with data
+            last_row = 0
+            for i, row in enumerate(all_values, 1):
+                if any(cell.strip() for cell in row if cell):
+                    last_row = i
+            
+            # Find last column with data
+            last_col = 0
+            for row in all_values:
+                for i, cell in enumerate(row, 1):
+                    if cell and cell.strip():
+                        last_col = max(last_col, i)
+            
+            # Add buffer
+            target_rows = max(last_row + 20, 50)
+            target_cols = max(last_col + 2, 10)
+            
+            # Resize if needed
+            current_rows = worksheet.row_count
+            current_cols = worksheet.col_count
+            
+            if current_rows > target_rows or current_cols > target_cols:
+                worksheet.resize(rows=target_rows, cols=target_cols)
+                logger.info(f"Trimmed sheet {worksheet.title} to {target_rows}x{target_cols}")
+                
+        except Exception as e:
+            logger.error(f"Failed to trim sheet: {e}")
 
     def _get_moscow_now(self):
         """Get current time in Moscow timezone"""
@@ -113,7 +158,6 @@ class SamboBot:
         if date is None:
             date = self._get_moscow_now()
         
-        # Monday is 0, Sunday is 6
         days_since_monday = date.weekday()
         week_start = date - timedelta(days=days_since_monday)
         return week_start.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -125,84 +169,84 @@ class SamboBot:
         week_start = self._get_week_start(date)
         return week_start.strftime("%Y-%m-%d")
 
-    # ========== SHEET 1: SAMBO HABITS ==========
+    # ========== SHEET 1: ACTIVITY HABITS ==========
     
-    def _ensure_sheet_structure(self):
-        """Ensure Sheet1 has proper structure"""
+    def _ensure_activity_sheet_structure(self):
+        """Ensure Activity sheet has proper structure"""
         try:
-            if not self.sheet:
+            if not self.activity_sheet:
                 return
             
-            # Check if headers exist
-            headers = self.sheet.row_values(1)
+            headers = self.activity_sheet.row_values(1) if self.activity_sheet.row_count > 0 else []
             expected_headers = [
                 "User ID", "Date", "Prayer", "Qi Gong", "Ball", "Run/Stretch", 
-                "Strength/Stretch", "Week Number", "Goals from Last Week"
+                "Strength/Stretch", "Week Number", "Goals"
             ]
             
             if headers != expected_headers:
-                self.sheet.clear()
-                self.sheet.append_row(expected_headers)
-                logger.info("Sheet1 structure initialized")
+                self.activity_sheet.clear()
+                self.activity_sheet.append_row(expected_headers)
+                logger.info("Activity sheet structure initialized")
+                
+            self._trim_sheet(self.activity_sheet)
         except Exception as e:
-            logger.error(f"Failed to ensure sheet structure: {e}")
+            logger.error(f"Failed to ensure activity sheet structure: {e}")
 
-    def _get_user_row(self, user_id, week_number):
-        """Get or create user's row for the week in Sheet1"""
+    def _get_activity_row(self, user_id, week_number):
+        """Get or create user's row for the week in Activity sheet"""
         try:
-            all_rows = self.sheet.get_all_values()
+            all_rows = self.activity_sheet.get_all_values()
             
-            # Find existing row for this user and week
-            for row_idx, row in enumerate(all_rows[1:], start=2):  # Skip header
+            for row_idx, row in enumerate(all_rows[1:], start=2):
                 if len(row) > 7:
-                    # Check User ID (col 0) and Week Number (col 7)
                     if row[0] == str(user_id) and row[7] == week_number:
                         return row_idx, row
             
-            # Create new row
+            # Trim before adding new row
+            self._trim_sheet(self.activity_sheet)
+            
             new_row = [str(user_id), "", "", "", "", "", "", week_number, ""]
-            self.sheet.append_row(new_row)
-            return self.sheet.row_count, new_row
+            self.activity_sheet.append_row(new_row)
+            return self.activity_sheet.row_count, new_row
         except Exception as e:
-            logger.error(f"Failed to get user row: {e}")
+            logger.error(f"Failed to get activity row: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None, None
 
     def _record_habit(self, user_id, habit_id):
-        """Record a completed habit in Sheet1"""
+        """Record a completed habit in Activity sheet"""
         try:
-            if not self.sheet:
-                logger.error("Sheet not initialized")
-                return False, "Sheet not initialized"
+            if not self.activity_sheet:
+                return False, "Activity sheet not initialized"
             
             if habit_id not in HABITS:
                 return False, f"Invalid habit number. Use 1-5."
             
             week_number = self._get_week_number()
-            row_num, row_data = self._get_user_row(user_id, week_number)
+            row_num, row_data = self._get_activity_row(user_id, week_number)
             
             if row_num is None:
-                logger.error(f"Failed to get row for user {user_id}")
                 return False, "Failed to record habit"
             
-            # Column mapping: UserID=1, Date=2, Prayer=3, QiGong=4, Ball=5, Run=6, Strength=7
             col_map = {1: 3, 2: 4, 3: 5, 4: 6, 5: 7}
             col = col_map[habit_id]
             
-            # Check for duplicates
-            current_value = self.sheet.cell(row_num, col).value
+            current_value = self.activity_sheet.cell(row_num, col).value
             
             if current_value:
                 return False, f"{HABITS[habit_id]} already recorded today"
             
-            # Record the habit with today's date
             today = self._get_moscow_now().strftime("%Y-%m-%d")
-            self.sheet.update_cell(row_num, 2, today)  # Update date column
-            self.sheet.update_cell(row_num, col, "✓")  # Mark as done
+            self.activity_sheet.update_cell(row_num, 2, today)
+            self.activity_sheet.update_cell(row_num, col, "✓")
             
-            logger.info(f"Recorded habit {habit_id} for user {user_id} in row {row_num}, col {col}")
+            logger.info(f"Recorded habit {habit_id} for user {user_id}")
             return True, f"✓ {HABITS[habit_id]} recorded!"
         except Exception as e:
-            logger.error(f"Failed to record habit {habit_id} for user {user_id}: {e}")
+            logger.error(f"Failed to record habit: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False, "Error recording habit"
 
     # ========== SHEET 2: CONSUMPTION HABITS ==========
@@ -213,17 +257,18 @@ class SamboBot:
             if not self.consumption_sheet:
                 return
             
-            # Check if headers exist
-            headers = self.consumption_sheet.row_values(1)
+            headers = self.consumption_sheet.row_values(1) if self.consumption_sheet.row_count > 0 else []
             expected_headers = [
-                "User ID", "Date", "Week Number", "Coffee (x)", "Coffee Cost (руб)", 
-                "Sugary (y)", "Sugary Cost (руб)", "Flour (z)", "Flour Cost (руб)"
+                "User ID", "Date", "Week Number", "Coffee (x)", "Coffee Cost", 
+                "Sugary (y)", "Sugary Cost", "Flour (z)", "Flour Cost"
             ]
             
             if headers != expected_headers:
                 self.consumption_sheet.clear()
                 self.consumption_sheet.append_row(expected_headers)
                 logger.info("Consumption sheet structure initialized")
+                
+            self._trim_sheet(self.consumption_sheet)
         except Exception as e:
             logger.error(f"Failed to ensure consumption sheet structure: {e}")
 
@@ -239,14 +284,14 @@ class SamboBot:
             today_str = date.strftime("%Y-%m-%d")
             all_rows = self.consumption_sheet.get_all_values()
             
-            # Find existing row for this user, week, and specific date
-            for row_idx, row in enumerate(all_rows[1:], start=2):  # Skip header
+            for row_idx, row in enumerate(all_rows[1:], start=2):
                 if len(row) > 2:
-                    # Check User ID (col 0), Date (col 1), and Week Number (col 2)
                     if row[0] == str(user_id) and row[1] == today_str and row[2] == week_number:
                         return row_idx, row
             
-            # Create new row for today
+            # Trim before adding new row
+            self._trim_sheet(self.consumption_sheet)
+            
             new_row = [str(user_id), today_str, week_number, "", "", "", "", "", ""]
             self.consumption_sheet.append_row(new_row)
             return self.consumption_sheet.row_count, new_row
@@ -258,15 +303,13 @@ class SamboBot:
         """Parse consumption input like 'xxx', 'xx 150', 'y 75', etc."""
         text = text.strip().lower()
         
-        # Match pattern: (x,y,z letters) optional space optional number
         match = re.match(r'^([xyz]+)(?:\s+(\d+))?$', text)
         if not match:
-            return None, None
+            return None
         
         letters = match.group(1)
         cost = match.group(2)
         
-        # Determine type (x, y, or z)
         if 'x' in letters:
             habit_type = 'x'
         elif 'y' in letters:
@@ -274,68 +317,52 @@ class SamboBot:
         elif 'z' in letters:
             habit_type = 'z'
         else:
-            return None, None
+            return None
         
-        # Count the specific letters (filter only the relevant type)
         count = letters.count(habit_type)
-        
-        # Convert cost to integer if provided
         cost_int = int(cost) if cost else 0
         
         return habit_type, count, cost_int
 
     def _record_consumption(self, user_id, text):
-        """Record consumption in Sheet2"""
+        """Record consumption in Consumption sheet"""
         try:
             if not self.consumption_sheet:
                 return False, "Consumption sheet not initialized"
             
-            # Parse input
             result = self._parse_consumption_input(text)
             if not result:
-                return False, "Invalid format. Use like 'x', 'xxx', 'xx 150', 'y 75', 'zzz 200'"
+                return False, "Invalid format. Use: 'x', 'xxx', 'xx 150', 'y 75', 'zzz 200'"
             
             habit_type, count, cost = result
             
-            # Get current date and week
             now = self._get_moscow_now()
-            today_str = now.strftime("%Y-%m-%d")
             week_number = self._get_week_number(now)
             
-            # Get or create row for today
             row_num, row_data = self._get_consumption_row(user_id, week_number, now)
             if row_num is None:
                 return False, "Failed to create consumption record"
             
-            # Determine columns based on type
             if habit_type == 'x':
-                count_col = 4  # Coffee (x)
-                cost_col = 5   # Coffee Cost
+                count_col, cost_col = 4, 5
             elif habit_type == 'y':
-                count_col = 6  # Sugary (y)
-                cost_col = 7   # Sugary Cost
-            else:  # 'z'
-                count_col = 8  # Flour (z)
-                cost_col = 9   # Flour Cost
+                count_col, cost_col = 6, 7
+            else:
+                count_col, cost_col = 8, 9
             
-            # Get current values
             current_count_str = self.consumption_sheet.cell(row_num, count_col).value or "0"
             current_cost_str = self.consumption_sheet.cell(row_num, cost_col).value or "0"
             
-            # Parse current values
             current_count = int(current_count_str) if current_count_str.isdigit() else 0
             current_cost = int(current_cost_str) if current_cost_str.isdigit() else 0
             
-            # Update values
             new_count = current_count + count
             new_cost = current_cost + cost
             
-            # Update cells
             self.consumption_sheet.update_cell(row_num, count_col, str(new_count))
             if cost > 0:
                 self.consumption_sheet.update_cell(row_num, cost_col, str(new_cost))
             
-            # Prepare response
             habit_name = CONSUMPTION_HABITS[habit_type]
             response = f"✓ {habit_name}: +{count} dose(s)"
             if cost > 0:
@@ -344,7 +371,7 @@ class SamboBot:
             if new_cost > 0:
                 response += f", {new_cost} руб"
             
-            logger.info(f"Recorded consumption: user={user_id}, type={habit_type}, count={count}, cost={cost}")
+            logger.info(f"Recorded consumption: type={habit_type}, count={count}, cost={cost}")
             return True, response
             
         except Exception as e:
@@ -353,187 +380,180 @@ class SamboBot:
             logger.error(traceback.format_exc())
             return False, "Error recording consumption"
 
-    def _get_weekly_consumption_summary(self, user_id):
-        """Get weekly consumption summary for feedback"""
+    # ========== SHEET 3: LANGUAGE LEARNING HABITS ==========
+    
+    def _ensure_language_sheet_structure(self):
+        """Ensure Language sheet has proper structure"""
         try:
-            if not self.consumption_sheet:
+            if not self.language_sheet:
+                return
+            
+            headers = self.language_sheet.row_values(1) if self.language_sheet.row_count > 0 else []
+            expected_headers = [
+                "User ID", "Date", "Week Number", "Chinese (ch)", "Hebrew (he)", "Tatar (ta)"
+            ]
+            
+            if headers != expected_headers:
+                self.language_sheet.clear()
+                self.language_sheet.append_row(expected_headers)
+                logger.info("Language sheet structure initialized")
+                
+            self._trim_sheet(self.language_sheet)
+        except Exception as e:
+            logger.error(f"Failed to ensure language sheet structure: {e}")
+
+    def _get_language_row(self, user_id, week_number, date=None):
+        """Get or create user's row for language tracking"""
+        try:
+            if not self.language_sheet:
+                return None, None
+            
+            if date is None:
+                date = self._get_moscow_now()
+            
+            today_str = date.strftime("%Y-%m-%d")
+            all_rows = self.language_sheet.get_all_values()
+            
+            for row_idx, row in enumerate(all_rows[1:], start=2):
+                if len(row) > 2:
+                    if row[0] == str(user_id) and row[1] == today_str and row[2] == week_number:
+                        return row_idx, row
+            
+            # Trim before adding new row
+            self._trim_sheet(self.language_sheet)
+            
+            new_row = [str(user_id), today_str, week_number, "", "", ""]
+            self.language_sheet.append_row(new_row)
+            return self.language_sheet.row_count, new_row
+        except Exception as e:
+            logger.error(f"Failed to get language row: {e}")
+            return None, None
+
+    def _record_language(self, user_id, text):
+        """Record language learning activity"""
+        try:
+            if not self.language_sheet:
+                return False, "Language sheet not initialized"
+            
+            text = text.strip().lower()
+            
+            # Determine language type
+            if text == 'ch':
+                lang_type = 'ch'
+                col = 4
+            elif text == 'he':
+                lang_type = 'he'
+                col = 5
+            elif text == 'ta':
+                lang_type = 'ta'
+                col = 6
+            else:
+                return False, "Invalid language code. Use: 'ch', 'he', or 'ta'"
+            
+            now = self._get_moscow_now()
+            week_number = self._get_week_number(now)
+            
+            row_num, row_data = self._get_language_row(user_id, week_number, now)
+            if row_num is None:
+                return False, "Failed to create language record"
+            
+            # Check if already recorded today
+            current_value = self.language_sheet.cell(row_num, col).value
+            if current_value:
+                return False, f"{LANGUAGE_HABITS[lang_type]} already recorded today"
+            
+            # Record the activity
+            self.language_sheet.update_cell(row_num, col, "✓")
+            
+            habit_name = LANGUAGE_HABITS[lang_type]
+            logger.info(f"Recorded language activity: type={lang_type}")
+            return True, f"✓ {habit_name} recorded!"
+            
+        except Exception as e:
+            logger.error(f"Failed to record language activity: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False, "Error recording language activity"
+
+    def _get_weekly_language_summary(self, user_id):
+        """Get weekly language learning summary"""
+        try:
+            if not self.language_sheet:
                 return None
             
             week_number = self._get_week_number()
-            all_rows = self.consumption_sheet.get_all_values()
+            all_rows = self.language_sheet.get_all_values()
             
-            totals = {
-                'x_count': 0,
-                'x_cost': 0,
-                'y_count': 0,
-                'y_cost': 0,
-                'z_count': 0,
-                'z_cost': 0
-            }
+            totals = {'ch': 0, 'he': 0, 'ta': 0}
             
             for row in all_rows[1:]:
-                if len(row) > 8 and row[0] == str(user_id) and row[2] == week_number:
-                    # Coffee
-                    if row[3] and row[3].isdigit():
-                        totals['x_count'] += int(row[3])
-                    if row[4] and row[4].isdigit():
-                        totals['x_cost'] += int(row[4])
-                    
-                    # Sugary
-                    if row[5] and row[5].isdigit():
-                        totals['y_count'] += int(row[5])
-                    if row[6] and row[6].isdigit():
-                        totals['y_cost'] += int(row[6])
-                    
-                    # Flour
-                    if row[7] and row[7].isdigit():
-                        totals['z_count'] += int(row[7])
-                    if row[8] and row[8].isdigit():
-                        totals['z_cost'] += int(row[8])
+                if len(row) > 5 and row[0] == str(user_id) and row[2] == week_number:
+                    if row[3] == "✓":
+                        totals['ch'] += 1
+                    if row[4] == "✓":
+                        totals['he'] += 1
+                    if row[5] == "✓":
+                        totals['ta'] += 1
             
             return totals
         except Exception as e:
-            logger.error(f"Failed to get weekly consumption summary: {e}")
+            logger.error(f"Failed to get weekly language summary: {e}")
             return None
-
-    def _format_consumption_feedback(self, totals):
-        """Format consumption feedback for weekly report"""
-        if not totals:
-            return "No consumption data this week."
-        
-        feedback = "☕ **Consumption Summary**\n\n"
-        
-        # Coffee
-        feedback += f"• Coffee (x): {totals['x_count']} dose(s)"
-        if totals['x_cost'] > 0:
-            feedback += f", {totals['x_cost']} руб"
-        feedback += "\n"
-        
-        # Sugary
-        feedback += f"• Sugary food (y): {totals['y_count']} dose(s)"
-        if totals['y_cost'] > 0:
-            feedback += f", {totals['y_cost']} руб"
-        feedback += "\n"
-        
-        # Flour
-        feedback += f"• Flour-based food (z): {totals['z_count']} dose(s)"
-        if totals['z_cost'] > 0:
-            feedback += f", {totals['z_cost']} руб"
-        feedback += "\n"
-        
-        # Calculate totals
-        total_cost = totals['x_cost'] + totals['y_cost'] + totals['z_cost']
-        feedback += f"\n💰 **Weekly total spent**: {total_cost} руб"
-        
-        return feedback
 
     # ========== TELEGRAM HANDLERS ==========
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command"""
         await update.message.reply_text(
-            "🥋 Welcome to Sambo Habits & Consumption Tracker!\n\n"
-            "**For Sambo Habits (1-5):**\n"
+            "🥋 Welcome to Sambo Habits Tracker!\n\n"
+            "**Activity Habits (1-5):**\n"
             "1 - Prayer with first water\n"
             "2 - Qi Gong routine\n"
             "3 - Freestyling on the ball\n"
             "4 - 20 minute run and stretch\n"
             "5 - Strengthening and stretching\n\n"
-            "**For Consumption Tracking:**\n"
-            "• x - Coffee dose (x, xx, xxx 150)\n"
+            "**Consumption Tracking:**\n"
+            "• x - Coffee (x, xx, xxx 150)\n"
             "• y - Sugary food (y, yy 75)\n"
-            "• z - Flour-based food (z, zz 200)\n\n"
-            "Add price after space if purchased.\n"
+            "• z - Flour food (z, zz 200)\n\n"
+            "**Language Learning:**\n"
+            "• ch - Chinese activation\n"
+            "• he - Hebrew cards\n"
+            "• ta - Tatar cards\n\n"
             "Send each entry separately. Sunday is rest day."
         )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages"""
         user_id = update.effective_user.id
-        text = update.message.text.strip()
+        text = update.message.text.strip().lower()
         
-        # Check for consumption entries first (x, y, z)
-        if text and text[0].lower() in ['x', 'y', 'z']:
+        # Check for language learning (ch, he, ta)
+        if text in ['ch', 'he', 'ta']:
+            success, message = self._record_language(user_id, text)
+            await update.message.reply_text(message)
+            return
+        
+        # Check for consumption entries (x, y, z)
+        if text and text[0] in ['x', 'y', 'z']:
             success, message = self._record_consumption(user_id, text)
             await update.message.reply_text(message)
             return
         
-        # Check for sambo habit numbers (1-5)
+        # Check for activity habit numbers (1-5)
         if text.isdigit() and 1 <= int(text) <= 5:
             habit_id = int(text)
             success, message = self._record_habit(user_id, habit_id)
             await update.message.reply_text(message)
             return
         
-        # Check for other consumption patterns
-        if any(char.lower() in ['x', 'y', 'z'] for char in text):
-            success, message = self._record_consumption(user_id, text)
-            await update.message.reply_text(message)
-            return
-        
         # Unknown input
         await update.message.reply_text(
             "Please send:\n"
-            "• A number 1-5 for Sambo habits\n"
-            "• x, y, or z for consumption (e.g., 'x', 'xx 150', 'yyy 200')"
+            "• 1-5 for activity habits\n"
+            "• x/y/z for consumption (e.g., 'x', 'xx 150')\n"
+            "• ch/he/ta for language learning"
         )
-
-    async def send_weekly_feedback(self, context: ContextTypes.DEFAULT_TYPE):
-        """Send weekly feedback on Saturday at 18:20 Moscow time"""
-        logger.info("Sending weekly feedback")
-        
-        try:
-            # Get all users from both sheets
-            sambo_users = set()
-            consumption_users = set()
-            
-            # Get users from Sambo sheet
-            if self.sheet:
-                all_rows = self.sheet.get_all_values()
-                for row in all_rows[1:]:
-                    if row and row[0]:
-                        try:
-                            sambo_users.add(int(row[0]))
-                        except ValueError:
-                            continue
-            
-            # Get users from Consumption sheet
-            if self.consumption_sheet:
-                all_rows = self.consumption_sheet.get_all_values()
-                for row in all_rows[1:]:
-                    if row and row[0]:
-                        try:
-                            consumption_users.add(int(row[0]))
-                        except ValueError:
-                            continue
-            
-            # Combine all users
-            all_users = sambo_users.union(consumption_users)
-            
-            for user_id in all_users:
-                try:
-                    # Send consumption summary
-                    totals = self._get_weekly_consumption_summary(user_id)
-                    if totals and (totals['x_count'] > 0 or totals['y_count'] > 0 or totals['z_count'] > 0):
-                        consumption_feedback = self._format_consumption_feedback(totals)
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=consumption_feedback,
-                            parse_mode="Markdown"
-                        )
-                        await asyncio.sleep(1)  # Small delay between messages
-                        
-                    # Note: You could add Sambo feedback here too if needed
-                    # (you already have the logic from your original code)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to send feedback to user {user_id}: {e}")
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"Failed to send weekly feedback: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
 
     def run(self):
         """Start the bot"""
@@ -546,21 +566,6 @@ class SamboBot:
         # Handlers
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        
-        # Schedule weekly feedback if job queue is available
-        try:
-            job_queue = app.job_queue
-            if job_queue:
-                # Consumption feedback at 18:20 on Saturday
-                job_queue.run_daily(
-                    self.send_weekly_feedback,
-                    time=datetime.strptime("18:20", "%H:%M").time(),
-                    days=[5],  # Saturday
-                    tzinfo=MOSCOW_TZ
-                )
-                logger.info("Scheduled consumption feedback for Saturday 18:20 Moscow time")
-        except Exception as e:
-            logger.warning(f"Could not set up job queue: {e}")
         
         logger.info("Bot started and polling for messages...")
         app.run_polling()
