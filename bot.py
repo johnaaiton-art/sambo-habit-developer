@@ -119,35 +119,19 @@ class SamboBot:
     def _trim_sheet(self, worksheet):
         """Remove empty rows and columns beyond actual data to prevent phantom cells"""
         try:
-            all_values = worksheet.get_all_values()
-            
-            # Find last row with data
-            last_row = 0
-            for i, row in enumerate(all_values, 1):
-                if any(cell.strip() for cell in row if cell):
-                    last_row = i
-            
-            # Find last column with data
-            last_col = 0
-            for row in all_values:
-                for i, cell in enumerate(row, 1):
-                    if cell and cell.strip():
-                        last_col = max(last_col, i)
-            
-            # Add buffer
-            target_rows = max(last_row + 20, 50)
-            target_cols = max(last_col + 2, 10)
-            
-            # Resize if needed
+            # Just ensure minimum size, don't trim down
             current_rows = worksheet.row_count
             current_cols = worksheet.col_count
             
-            if current_rows > target_rows or current_cols > target_cols:
-                worksheet.resize(rows=target_rows, cols=target_cols)
-                logger.info(f"Trimmed sheet {worksheet.title} to {target_rows}x{target_cols}")
+            min_rows = 200
+            min_cols = 15
+            
+            if current_rows < min_rows or current_cols < min_cols:
+                worksheet.resize(rows=max(current_rows, min_rows), cols=max(current_cols, min_cols))
+                logger.info(f"Resized sheet {worksheet.title} to {max(current_rows, min_rows)}x{max(current_cols, min_cols)}")
                 
         except Exception as e:
-            logger.error(f"Failed to trim sheet: {e}")
+            logger.error(f"Failed to resize sheet: {e}")
 
     def _get_moscow_now(self):
         """Get current time in Moscow timezone"""
@@ -202,20 +186,21 @@ class SamboBot:
             week_number = self._get_week_number(date)
             
             all_rows = self.activity_sheet.get_all_values()
+            logger.info(f"Activity sheet has {len(all_rows)} rows total")
             
             # Look for existing row for this user and date
             for row_idx, row in enumerate(all_rows[1:], start=2):
                 if len(row) > 1:
                     if row[0] == str(user_id) and row[1] == today_str:
+                        logger.info(f"Found existing row {row_idx} for user {user_id} on {today_str}")
                         return row_idx, row
-            
-            # Trim before adding new row
-            self._trim_sheet(self.activity_sheet)
             
             # Create new row for today
             new_row = [str(user_id), today_str, "", "", "", "", "", week_number, ""]
             self.activity_sheet.append_row(new_row)
-            return self.activity_sheet.row_count, new_row
+            new_row_num = len(all_rows) + 1
+            logger.info(f"Created new row {new_row_num} for user {user_id} on {today_str}")
+            return new_row_num, new_row
         except Exception as e:
             logger.error(f"Failed to get activity row: {e}")
             import traceback
@@ -291,18 +276,20 @@ class SamboBot:
             
             today_str = date.strftime("%Y-%m-%d")
             all_rows = self.consumption_sheet.get_all_values()
+            logger.info(f"Consumption sheet has {len(all_rows)} rows total")
             
             for row_idx, row in enumerate(all_rows[1:], start=2):
                 if len(row) > 2:
                     if row[0] == str(user_id) and row[1] == today_str and row[2] == week_number:
+                        logger.info(f"Found existing consumption row {row_idx}")
                         return row_idx, row
             
-            # Trim before adding new row
-            self._trim_sheet(self.consumption_sheet)
-            
+            # Create new row
             new_row = [str(user_id), today_str, week_number, "", "", "", "", "", ""]
             self.consumption_sheet.append_row(new_row)
-            return self.consumption_sheet.row_count, new_row
+            new_row_num = len(all_rows) + 1
+            logger.info(f"Created new consumption row {new_row_num}")
+            return new_row_num, new_row
         except Exception as e:
             logger.error(f"Failed to get consumption row: {e}")
             return None, None
@@ -421,18 +408,20 @@ class SamboBot:
             
             today_str = date.strftime("%Y-%m-%d")
             all_rows = self.language_sheet.get_all_values()
+            logger.info(f"Language sheet has {len(all_rows)} rows total")
             
             for row_idx, row in enumerate(all_rows[1:], start=2):
                 if len(row) > 2:
                     if row[0] == str(user_id) and row[1] == today_str and row[2] == week_number:
+                        logger.info(f"Found existing language row {row_idx}")
                         return row_idx, row
             
-            # Trim before adding new row
-            self._trim_sheet(self.language_sheet)
-            
+            # Create new row
             new_row = [str(user_id), today_str, week_number, "", "", ""]
             self.language_sheet.append_row(new_row)
-            return self.language_sheet.row_count, new_row
+            new_row_num = len(all_rows) + 1
+            logger.info(f"Created new language row {new_row_num}")
+            return new_row_num, new_row
         except Exception as e:
             logger.error(f"Failed to get language row: {e}")
             return None, None
