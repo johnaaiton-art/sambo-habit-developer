@@ -192,20 +192,28 @@ class SamboBot:
         except Exception as e:
             logger.error(f"Failed to ensure activity sheet structure: {e}")
 
-    def _get_activity_row(self, user_id, week_number):
-        """Get or create user's row for the week in Activity sheet"""
+    def _get_activity_row(self, user_id, date=None):
+        """Get or create user's row for the day in Activity sheet"""
         try:
+            if date is None:
+                date = self._get_moscow_now()
+            
+            today_str = date.strftime("%Y-%m-%d")
+            week_number = self._get_week_number(date)
+            
             all_rows = self.activity_sheet.get_all_values()
             
+            # Look for existing row for this user and date
             for row_idx, row in enumerate(all_rows[1:], start=2):
-                if len(row) > 7:
-                    if row[0] == str(user_id) and row[7] == week_number:
+                if len(row) > 1:
+                    if row[0] == str(user_id) and row[1] == today_str:
                         return row_idx, row
             
             # Trim before adding new row
             self._trim_sheet(self.activity_sheet)
             
-            new_row = [str(user_id), "", "", "", "", "", "", week_number, ""]
+            # Create new row for today
+            new_row = [str(user_id), today_str, "", "", "", "", "", week_number, ""]
             self.activity_sheet.append_row(new_row)
             return self.activity_sheet.row_count, new_row
         except Exception as e:
@@ -223,22 +231,22 @@ class SamboBot:
             if habit_id not in HABITS:
                 return False, f"Invalid habit number. Use 1-5."
             
-            week_number = self._get_week_number()
-            row_num, row_data = self._get_activity_row(user_id, week_number)
+            row_num, row_data = self._get_activity_row(user_id)
             
             if row_num is None:
                 return False, "Failed to record habit"
             
+            # Column mapping: 1->C(3), 2->D(4), 3->E(5), 4->F(6), 5->G(7)
             col_map = {1: 3, 2: 4, 3: 5, 4: 6, 5: 7}
             col = col_map[habit_id]
             
+            # Check if already recorded
             current_value = self.activity_sheet.cell(row_num, col).value
             
-            if current_value:
+            if current_value and current_value.strip():
                 return False, f"{HABITS[habit_id]} already recorded today"
             
-            today = self._get_moscow_now().strftime("%Y-%m-%d")
-            self.activity_sheet.update_cell(row_num, 2, today)
+            # Record the habit
             self.activity_sheet.update_cell(row_num, col, "✓")
             
             logger.info(f"Recorded habit {habit_id} for user {user_id}")
