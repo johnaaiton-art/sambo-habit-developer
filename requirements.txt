@@ -1,7 +1,15 @@
-python-telegram-bot==21.0.1
-gspread==6.1.2
-google-auth-oauthlib==1.2.1
+# Telegram Bot Framework
+python-telegram-bot==20.7
+telegram==0.0.1
+
+# Google Sheets Integration
+gspread==6.0.0
+google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
-google-auth==2.27.0
+google-auth==2.28.0
+
+# HTTP Requests (for DeepSeek API)
 requests==2.31.0
-python-dotenv==1.0.1
+
+# Utilities
+python-dotenv==1.0.0
