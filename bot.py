@@ -7,7 +7,7 @@ Includes automatic weekly feedback via DeepSeek AI
 import os
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 import logging
 
@@ -15,8 +15,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import gspread
 from google.oauth2.service_account import Credentials
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 import requests
 
 # Configure logging
@@ -68,9 +66,6 @@ class SamboBot:
         self.consumption_sheet = None
         self.language_sheet = None
         self._init_google_sheets()
-        
-        # Initialize scheduler
-        self.scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
         
     def _init_google_sheets(self):
         """Initialize Google Sheets client with service account credentials"""
@@ -853,12 +848,12 @@ Keep up the great work! 💪
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
         # Schedule weekly feedback for Saturday at 19:20 Moscow time
+        # Using job_queue from python-telegram-bot (no APScheduler needed)
         app.job_queue.run_daily(
             self.send_weekly_feedback,
-            time=datetime.strptime("19:20", "%H:%M").time(),
+            time=time(19, 20),  # 19:20 (7:20 PM)
             days=[5],  # Saturday (0=Monday, 5=Saturday)
-            name="weekly_feedback",
-            chat_id=self.user_id
+            name="weekly_feedback"
         )
         
         logger.info("Bot started with scheduled feedback at Saturday 19:20 Moscow time")
