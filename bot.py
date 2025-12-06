@@ -1,6 +1,7 @@
 """
 Sambo Habits Tracking Telegram Bot
 Tracks activity, consumption, and language learning habits with Google Sheets integration
+Includes automatic weekly feedback via DeepSeek AI
 """
 
 import os
@@ -14,6 +15,9 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import gspread
 from google.oauth2.service_account import Credentials
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -55,6 +59,8 @@ class SamboBot:
     def __init__(self):
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        self.deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
+        self.user_id = os.getenv("TELEGRAM_USER_ID")  # User's Telegram ID for feedback
         
         # Initialize Google Sheets
         self.gs_client = None
@@ -62,6 +68,9 @@ class SamboBot:
         self.consumption_sheet = None
         self.language_sheet = None
         self._init_google_sheets()
+        
+        # Initialize scheduler
+        self.scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
         
     def _init_google_sheets(self):
         """Initialize Google Sheets client with service account credentials"""
@@ -497,6 +506,284 @@ class SamboBot:
             logger.error(f"Failed to get weekly language summary: {e}")
             return None
 
+    # ========== WEEKLY FEEDBACK MECHANISM ==========
+    
+    def _get_weekly_stats(self, user_id):
+        """Get current week statistics"""
+        try:
+            if not self.activity_sheet:
+                return None
+            
+            week_number = self._get_week_number()
+            all_rows = self.activity_sheet.get_all_values()
+            
+            stats = {
+                'week': week_number,
+                'daily_habits': {1: 0, 2: 0, 3: 0},
+                'weekly_habits': {4: 0, 5: 0},
+                'days_tracked': 0
+            }
+            
+            for row in all_rows[1:]:
+                if len(row) > 7 and row[0] == str(user_id) and row[7] == week_number:
+                    stats['days_tracked'] += 1
+                    # Check daily habits (columns 3-5 = habits 1-3)
+                    if row[2] == "✓":
+                        stats['daily_habits'][1] += 1
+                    if row[3] == "✓":
+                        stats['daily_habits'][2] += 1
+                    if row[4] == "✓":
+                        stats['daily_habits'][3] += 1
+                    # Check weekly habits (columns 6-7 = habits 4-5)
+                    if row[5] == "✓":
+                        stats['weekly_habits'][4] += 1
+                    if row[6] == "✓":
+                        stats['weekly_habits'][5] += 1
+            
+            return stats
+        except Exception as e:
+            logger.error(f"Failed to get weekly stats: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+
+    def _get_previous_weeks_stats(self, user_id, weeks_back=4):
+        """Get previous weeks statistics for comparison"""
+        try:
+            if not self.activity_sheet:
+                return None
+            
+            all_rows = self.activity_sheet.get_all_values()
+            previous_stats = {}
+            
+            for i in range(1, weeks_back + 1):
+                past_date = self._get_moscow_now() - timedelta(weeks=i)
+                week_number = self._get_week_number(past_date)
+                
+                stats = {
+                    'week': week_number,
+                    'daily_habits': {1: 0, 2: 0, 3: 0},
+                    'weekly_habits': {4: 0, 5: 0},
+                    'days_tracked': 0
+                }
+                
+                for row in all_rows[1:]:
+                    if len(row) > 7 and row[0] == str(user_id) and row[7] == week_number:
+                        stats['days_tracked'] += 1
+                        if row[2] == "✓":
+                            stats['daily_habits'][1] += 1
+                        if row[3] == "✓":
+                            stats['daily_habits'][2] += 1
+                        if row[4] == "✓":
+                            stats['daily_habits'][3] += 1
+                        if row[5] == "✓":
+                            stats['weekly_habits'][4] += 1
+                        if row[6] == "✓":
+                            stats['weekly_habits'][5] += 1
+                
+                previous_stats[week_number] = stats
+            
+            return previous_stats
+        except Exception as e:
+            logger.error(f"Failed to get previous weeks stats: {e}")
+            return None
+
+    def _get_consumption_stats(self, user_id):
+        """Get current week consumption statistics"""
+        try:
+            if not self.consumption_sheet:
+                return None
+            
+            week_number = self._get_week_number()
+            all_rows = self.consumption_sheet.get_all_values()
+            
+            stats = {
+                'coffee': {'count': 0, 'cost': 0},
+                'sugary': {'count': 0, 'cost': 0},
+                'flour': {'count': 0, 'cost': 0}
+            }
+            
+            for row in all_rows[1:]:
+                if len(row) > 8 and row[0] == str(user_id) and row[2] == week_number:
+                    # Coffee
+                    if row[3]:
+                        stats['coffee']['count'] += int(row[3]) if row[3].isdigit() else 0
+                    if row[4]:
+                        stats['coffee']['cost'] += int(row[4]) if row[4].isdigit() else 0
+                    # Sugary
+                    if row[5]:
+                        stats['sugary']['count'] += int(row[5]) if row[5].isdigit() else 0
+                    if row[6]:
+                        stats['sugary']['cost'] += int(row[6]) if row[6].isdigit() else 0
+                    # Flour
+                    if row[7]:
+                        stats['flour']['count'] += int(row[7]) if row[7].isdigit() else 0
+                    if row[8]:
+                        stats['flour']['cost'] += int(row[8]) if row[8].isdigit() else 0
+            
+            return stats
+        except Exception as e:
+            logger.error(f"Failed to get consumption stats: {e}")
+            return None
+
+    def _generate_feedback(self, user_id, current_stats, previous_stats, consumption_stats, language_stats):
+        """Generate AI-powered feedback using DeepSeek API"""
+        try:
+            if not self.deepseek_api_key:
+                logger.warning("DeepSeek API key not set, generating basic feedback")
+                return self._generate_basic_feedback(current_stats, previous_stats, consumption_stats, language_stats)
+            
+            # Prepare data for DeepSeek
+            prompt = f"""
+You are a supportive fitness and habit tracking coach. Analyze the following weekly performance data and provide encouraging, constructive feedback.
+
+CURRENT WEEK ({current_stats['week']}) PERFORMANCE:
+- Prayer with first water: {current_stats['daily_habits'][1]} times
+- Qi Gong routine: {current_stats['daily_habits'][2]} times
+- Freestyling on the ball: {current_stats['daily_habits'][3]} times
+- 20 minute run and stretch: {current_stats['weekly_habits'][4]} times
+- Strengthening and stretching: {current_stats['weekly_habits'][5]} times
+- Days tracked: {current_stats['days_tracked']}/6
+
+CONSUMPTION THIS WEEK:
+- Coffee: {consumption_stats['coffee']['count']} doses ({consumption_stats['coffee']['cost']} руб)
+- Sugary food: {consumption_stats['sugary']['count']} doses ({consumption_stats['sugary']['cost']} руб)
+- Flour-based food: {consumption_stats['flour']['count']} doses ({consumption_stats['flour']['cost']} руб)
+
+LANGUAGE LEARNING THIS WEEK:
+- Chinese activation: {language_stats['ch']} sessions
+- Hebrew cards: {language_stats['he']} sessions
+- Tatar cards: {language_stats['ta']} sessions
+
+PREVIOUS WEEKS COMPARISON:
+{self._format_previous_stats(previous_stats)}
+
+Please provide:
+1. A brief summary of this week's performance (2-3 sentences)
+2. Positive highlights (what went well)
+3. Areas for improvement
+4. One specific, actionable goal for next week
+5. Encouragement and motivation
+
+Keep the tone supportive and constructive. Use Russian if appropriate.
+"""
+            
+            response = requests.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.deepseek_api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 500
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                feedback = data['choices'][0]['message']['content']
+                logger.info("Successfully generated feedback from DeepSeek")
+                return feedback
+            else:
+                logger.error(f"DeepSeek API error: {response.status_code} - {response.text}")
+                return self._generate_basic_feedback(current_stats, previous_stats, consumption_stats, language_stats)
+                
+        except Exception as e:
+            logger.error(f"Failed to generate feedback: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return self._generate_basic_feedback(current_stats, previous_stats, consumption_stats, language_stats)
+
+    def _format_previous_stats(self, previous_stats):
+        """Format previous weeks stats for the prompt"""
+        if not previous_stats:
+            return "No previous data available."
+        
+        formatted = ""
+        for week, stats in sorted(previous_stats.items(), reverse=True):
+            total_daily = sum(stats['daily_habits'].values())
+            total_weekly = sum(stats['weekly_habits'].values())
+            formatted += f"\n{week}: {total_daily} daily habit completions, {total_weekly} weekly sessions"
+        
+        return formatted
+
+    def _generate_basic_feedback(self, current_stats, previous_stats, consumption_stats, language_stats):
+        """Generate basic feedback without AI"""
+        feedback = f"""
+📊 **WEEKLY FEEDBACK - {current_stats['week']}**
+
+**Activity Summary:**
+• Prayer: {current_stats['daily_habits'][1]} times
+• Qi Gong: {current_stats['daily_habits'][2]} times
+• Ball work: {current_stats['daily_habits'][3]} times
+• Running: {current_stats['weekly_habits'][4]} times
+• Strengthening: {current_stats['weekly_habits'][5]} times
+
+**Consumption:**
+• Coffee: {consumption_stats['coffee']['count']} doses ({consumption_stats['coffee']['cost']} руб)
+• Sugary: {consumption_stats['sugary']['count']} doses ({consumption_stats['sugary']['cost']} руб)
+• Flour: {consumption_stats['flour']['count']} doses ({consumption_stats['flour']['cost']} руб)
+
+**Language Learning:**
+• Chinese: {language_stats['ch']} sessions
+• Hebrew: {language_stats['he']} sessions
+• Tatar: {language_stats['ta']} sessions
+
+Keep up the great work! 💪
+"""
+        return feedback
+
+    async def send_weekly_feedback(self, context: ContextTypes.DEFAULT_TYPE):
+        """Send weekly feedback at 19:20 Saturday"""
+        try:
+            if not self.user_id:
+                logger.error("TELEGRAM_USER_ID not set, cannot send feedback")
+                return
+            
+            logger.info(f"Sending weekly feedback to user {self.user_id}")
+            
+            # Get statistics
+            current_stats = self._get_weekly_stats(int(self.user_id))
+            previous_stats = self._get_previous_weeks_stats(int(self.user_id))
+            consumption_stats = self._get_consumption_stats(int(self.user_id))
+            language_stats = self._get_weekly_language_summary(int(self.user_id))
+            
+            if not current_stats:
+                await context.bot.send_message(
+                    chat_id=self.user_id,
+                    text="📊 No activity recorded this week. Start logging your habits!"
+                )
+                return
+            
+            # Generate feedback
+            feedback = self._generate_feedback(
+                int(self.user_id),
+                current_stats,
+                previous_stats,
+                consumption_stats,
+                language_stats
+            )
+            
+            # Send feedback
+            await context.bot.send_message(
+                chat_id=self.user_id,
+                text=feedback,
+                parse_mode="Markdown"
+            )
+            
+            logger.info("Weekly feedback sent successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to send weekly feedback: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     # ========== TELEGRAM HANDLERS ==========
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -517,7 +804,8 @@ class SamboBot:
             "• ch - Chinese activation\n"
             "• he - Hebrew cards\n"
             "• ta - Tatar cards\n\n"
-            "Send each entry separately. Sunday is rest day."
+            "Send each entry separately. Sunday is rest day.\n\n"
+            "📊 Weekly feedback: Every Saturday at 19:20 Moscow time"
         )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -564,7 +852,17 @@ class SamboBot:
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
-        logger.info("Bot started and polling for messages...")
+        # Schedule weekly feedback for Saturday at 19:20 Moscow time
+        app.job_queue.run_daily(
+            self.send_weekly_feedback,
+            time=datetime.strptime("19:20", "%H:%M").time(),
+            days=[5],  # Saturday (0=Monday, 5=Saturday)
+            name="weekly_feedback",
+            chat_id=self.user_id
+        )
+        
+        logger.info("Bot started with scheduled feedback at Saturday 19:20 Moscow time")
+        logger.info("Polling for messages...")
         app.run_polling()
 
 
