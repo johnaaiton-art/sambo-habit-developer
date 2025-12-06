@@ -1,5 +1,5 @@
-# Telegram Bot Framework
-python-telegram-bot==20.7
+# Telegram Bot Framework (with job queue support)
+python-telegram-bot[job-queue]==20.7
 telegram==0.0.1
 
 # Google Sheets Integration
