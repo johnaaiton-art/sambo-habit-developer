@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import logging
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
@@ -841,6 +841,7 @@ Keep up the great work! 💪
             logger.error("TELEGRAM_BOT_TOKEN not set")
             return
         
+        # Create application with job queue enabled
         app = Application.builder().token(self.bot_token).build()
         
         # Handlers
@@ -848,7 +849,6 @@ Keep up the great work! 💪
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
         # Schedule weekly feedback for Saturday at 19:20 Moscow time
-        # Using job_queue from python-telegram-bot (no APScheduler needed)
         app.job_queue.run_daily(
             self.send_weekly_feedback,
             time=time(19, 20),  # 19:20 (7:20 PM)
